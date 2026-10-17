@@ -1,0 +1,26 @@
+# Runtime dependencies — ours and the vendored upstream server's. The upstream server needs
+# `ws` and `@modelcontextprotocol/sdk`, which root `npm install` already provides: Node resolves
+# imports by walking up from vendor/inssist-mcp/dist/, so the root node_modules satisfies them
+# (verified by resolving all four specifiers the dist uses with the vendor copy moved aside).
+/node_modules/
+/vendor/inssist-mcp/node_modules/
+
+# Browser profiles — these hold the Instagram session and must never be committed.
+/.chrome-profile/
+/.ext-profile/
+/.ext-profile-*/
+
+# Written by the draft queue at runtime.
+/drafts.json
+
+# Recorded GraphQL requests. The page's own body travels with them, and that body contains
+# `fb_dtsg` and `lsd` — tokens bound to the account that recorded them, so they are not
+# shareable even though the doc_ids are worth keeping. A fresh clone records its own the first
+# time `npm run browser` runs (see the auto-capture in that script).
+/scripts/captured-graphql.json
+
+# Scratch output from debugging sessions.
+/_*.txt
+/capture*.txt
+
+*.log

@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "IG MCP Bridge",
+  "version": "0.1.0",
+  "description": "Auto-pairs your signed-in instagram.com tab with the local instagram-mcp-free driver on 127.0.0.1. Loopback only, no remote servers, no telemetry.",
+  "minimum_chrome_version": "116",
+  "permissions": ["storage", "offscreen", "tabs"],
+  "host_permissions": [
+    "https://www.instagram.com/*",
+    "http://127.0.0.1/*",
+    "ws://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.instagram.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "IG MCP Bridge"
+  }
+}

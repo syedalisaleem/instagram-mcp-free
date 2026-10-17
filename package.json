@@ -1,0 +1,24 @@
+﻿{
+  "name": "ig-mcp-free",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Free driver that executes the @inssist/mcp tool contract directly against a logged-in Instagram web session. No INSSIST extension, no PRO, no Graph API.",
+  "license": "MIT",
+  "scripts": {
+    "driver": "node src/driver.mjs",
+    "browser": "node scripts/open-browser.mjs",
+    "mcp": "node src/mcp-server.mjs",
+    "test": "node scripts/smoke.mjs",
+    "test:unit": "node scripts/igok-test.mjs",
+    "test:ext": "node scripts/ext-test.mjs",
+    "diag": "node scripts/diag.mjs",
+    "survey": "node scripts/survey.mjs",
+    "gql": "node scripts/gql.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "playwright": "^1.49.0",
+    "ws": "^8.18.3"
+  }
+}

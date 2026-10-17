@@ -16,7 +16,7 @@
 import { chromium } from 'playwright'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { mkdirSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
 
 const EXT_DIR = fileURLToPath(new URL('../extension', import.meta.url))
 const PROFILE = process.env.IG_MCP_EXT_PROFILE ?? fileURLToPath(new URL('../.ext-profile', import.meta.url))
@@ -46,9 +46,17 @@ mkdirSync(PROFILE, { recursive: true })
  */
 const attach = () => chromium.connectOverCDP(`http://127.0.0.1:${CDP_PORT}`)
 
-let context = await attach().catch(() => null)
+/**
+ * `connectOverCDP` resolves to a **Browser**, but everything below wants its BrowserContext:
+ * service workers, `addCookies`, `pages()`, `newPage()` and `cookies()` are all context methods
+ * and none of them exist on a Browser. Reading `context.serviceWorkers` off the Browser is what
+ * killed every detached launch one line after the window opened — invisibly, because spawning
+ * Chrome happens *before* this point and the extension pairs with the driver on its own, so the
+ * only symptom was this script's own traceback while the stack beneath it kept working.
+ */
+let browser = await attach().catch(() => null)
 
-if (!context) {
+if (!browser) {
   spawn(
     chromium.executablePath(),
     [
@@ -67,12 +75,12 @@ if (!context) {
     { detached: true, stdio: 'ignore' },
   ).unref()
 
-  for (let attempt = 0; attempt < 60 && !context; attempt += 1) {
+  for (let attempt = 0; attempt < 60 && !browser; attempt += 1) {
     await sleep(500)
-    context = await attach().catch(() => null)
+    browser = await attach().catch(() => null)
   }
 
-  if (!context) {
+  if (!browser) {
     console.error(
       `\nFAIL: could not reach Chrome on 127.0.0.1:${CDP_PORT}.\n` +
         '  It may still be starting, or another browser may hold the debugging port.',
@@ -81,17 +89,32 @@ if (!context) {
   }
 }
 
-let worker = context.serviceWorkers()[0] ?? (await context.waitForEvent('serviceworker', { timeout: 15_000 }).catch(() => null))
+// The default context carries the pages and the extension's service worker. connectOverCDP has
+// hydrated the target list by the time it resolves, so this reads on the first pass — the poll
+// exists only so a late-arriving context reports itself clearly instead of throwing a
+// TypeError at the line below it.
+let context = browser.contexts()[0] ?? null
+for (let attempt = 0; attempt < 20 && !context; attempt += 1) {
+  await sleep(250)
+  context = browser.contexts()[0] ?? null
+}
 
-if (!worker) {
-  console.error(
-    '\nFAIL: the extension did not load a service worker.\n' +
-      '  Open chrome://extensions in this window and look for an "Errors" link.\n' +
-      '  If you edited extension/ files since installing, delete .ext-profile/ and retry —\n' +
-      '  Chrome can keep serving the previous copy from a profile it already knows.',
-  )
+if (!context) {
+  console.error('\nFAIL: connected to Chrome but it exposed no browser context.')
   process.exit(1)
 }
+
+/**
+ * The extension's service worker, if Playwright can see it right now.
+ *
+ * Playwright reports service workers it watched start — which is what happens when it owns the
+ * browser process. Attached over CDP to a window that is already running, the extension's worker
+ * predates the connection and never enters `serviceWorkers()`, even though the worker is plainly
+ * alive: the control plane reports it paired. So an empty list is not a failure on its own.
+ * Pairing below asks whichever end can answer, and a window that truly failed to load the
+ * extension is caught there too, where the actionable advice lives.
+ */
+let worker = context.serviceWorkers()[0] ?? null
 
 /**
  * Optional: adopt a session you already hold instead of typing a password into the window.
@@ -168,21 +191,67 @@ const captureApiHeaders = target => {
 captureApiHeaders(page)
 
 say('3. waiting for the extension to attach to the driver')
+
+/**
+ * The pairing handshake has two observers and either is sufficient: the extension writes
+ * `driver.connected` into its own storage when its socket opens, and the driver flips
+ * `bridge.connected` when that socket lands on its side — the same event, opposite ends.
+ *
+ * Asking the extension needs its worker to be visible over CDP (which, per above, it may not
+ * be); asking the driver needs only the control plane it already runs for diagnostics. So read
+ * whichever answer is available on each pass, extension first, and keep re-reading `serviceWorkers()`
+ * — Playwright can surface a late-starting worker mid-loop, and then the richer answer
+ * (including which URL it connected to) becomes available for free.
+ */
 const deadline = Date.now() + 30_000
-let state = null
-while (Date.now() < deadline) {
-  state = await worker.evaluate(() => chrome.storage.local.get('driver')).catch(() => null)
-  if (state?.driver?.connected) break
+let paired = false
+let detail = null
+
+while (Date.now() < deadline && !paired) {
+  worker ??= context.serviceWorkers()[0] ?? null
+
+  let state = null
+  if (worker) {
+    state = await worker.evaluate(() => chrome.storage.local.get('driver')).catch(() => null)
+    if (state?.driver?.connected) {
+      detail = state.driver
+      paired = true
+      break
+    }
+  }
+
+  // No worker visible, or its storage did not answer: ask the driver, which hears the same
+  // socket land without needing anything from the browser.
+  if (!state) {
+    const status = await fetch('http://127.0.0.1:48234/status')
+      .then(response => response.json())
+      .catch(() => null)
+    if (status?.bridge?.connected) {
+      paired = true
+      break
+    }
+  }
+
   await sleep(400)
 }
 
-if (!state?.driver?.connected) {
+if (!paired) {
   say('')
-  say(`   NOT paired yet (state: ${JSON.stringify(state?.driver ?? null)})`)
-  say('   The extension is running but could not reach the driver.')
-  say('   Start it with `npm run driver` in another terminal, then reopen this window.')
+  say('   NOT paired after 30s.')
+  if (worker) {
+    say(`   The extension is visible but reports: ${JSON.stringify(detail ?? 'not connected')}`)
+    say('   Start the driver with `npm run driver` in another terminal, then reopen this window.')
+  } else {
+    say('   Neither the extension nor the driver answered — the extension worker was never')
+    say('   visible over CDP. Open chrome://extensions in this window and look for an "Errors"')
+    say('   link. If you edited extension/ files since installing, delete .ext-profile/ and')
+    say('   retry — Chrome can keep serving the previous copy from a profile it knows.')
+    say('   Also confirm `npm run driver` is running (it reports on 127.0.0.1:48234/status).')
+  }
+} else if (detail) {
+  say(`   paired with ${detail.url ?? 'the local driver'}`)
 } else {
-  say(`   paired with ${state.driver.url ?? 'the local driver'}`)
+  say('   paired — confirmed by the driver (extension worker not visible over CDP)')
 }
 
 // Optional capture pass. Instagram's feed is server-rendered and makes no API calls while
@@ -365,12 +434,53 @@ if (process.env.IG_MCP_GQL || !existsSync(CAPTURE_PATH)) {
 
   const list = [...seen.values()]
   const outPath = fileURLToPath(new URL('./captured-graphql.json', import.meta.url))
-  writeFileSync(outPath, JSON.stringify(list, null, 2))
 
-  say('')
-  say(list.length ? 'captured doc_ids:' : '   nothing captured — no GraphQL fired while driving')
-  for (const entry of list) say(`   ${entry.doc_id.padEnd(26)} ${entry.where}`)
-  say(`written to ${outPath}`)
+  /**
+   * Merge with what is on disk instead of overwriting, and write nothing when this run saw
+   * nothing. Both halves are load-bearing:
+   *
+   * An empty write is the nasty one. Instagram can answer a navigated screen with its HTML
+   * shell instead of firing GraphQL, `list` comes back empty — and writing `[]` then makes the
+   * file *exist*, so first-launch auto-capture (which keys off the file's absence) never fires
+   * again and search stays broken with no signal anywhere. Refusing to write leaves the
+   * condition unsatisfied, so the next launch simply retries.
+   *
+   * A partial write is the quiet one: tokens rotate, so a force-run must be able to refresh
+   * every doc_id it observes — but replacing the file wholesale would delete the entries whose
+   * screens weren't walked this time, taking those tools down with them. The union keys on the
+   * same `(doc_id, body)` pair the run itself dedupes on, newest observation winning, so a run
+   * can only ever add or refresh.
+   */
+  const keyOf = entry => `${entry.doc_id}|${entry.raw ?? JSON.stringify(entry.variables)}`
+  let mergedCount = 0
+
+  if (!list.length) {
+    say('')
+    say('   nothing captured — no GraphQL fired while driving')
+    say(
+      existsSync(outPath)
+        ? '   the existing capture was left untouched'
+        : '   no capture on disk — first-launch auto-capture retries on the next run',
+    )
+  } else {
+    const existing = existsSync(outPath) ? JSON.parse(readFileSync(outPath, 'utf8')) : []
+    const keyed = new Map()
+    // Newest run first, and stamped. `graphqlCaptured` reads the first entry for a doc_id that
+    // carries real variables, so file order decides whose tokens get replayed after a refresh —
+    // appending fresh captures behind the old ones would leave every refreshed doc_id still
+    // selecting the stale copy ahead of it. The timestamp makes that preference survive any
+    // future reordering, because entries with no stamp are simply treated as the oldest.
+    for (const entry of list) keyed.set(keyOf(entry), { ...entry, capturedAt: Date.now() })
+    for (const entry of existing) keyed.set(keyOf(entry), entry)
+    const merged = [...keyed.values()]
+    writeFileSync(outPath, JSON.stringify(merged, null, 2))
+    mergedCount = merged.length
+
+    say('')
+    say('captured doc_ids:')
+    for (const entry of list) say(`   ${entry.doc_id.padEnd(26)} ${entry.where}`)
+    say(`written to ${outPath} (${mergedCount} entries after merging with what was there)`)
+  }
 }
 
 say('')

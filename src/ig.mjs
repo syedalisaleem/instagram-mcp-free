@@ -116,10 +116,18 @@ export const graphqlCaptured = async (session, docId, variables = {}) => {
     throw new Error(`doc_id ${docId} was never captured. Run \`IG_MCP_GQL=1 npm run browser\`.`)
   }
 
-  // Prefer the capture that carried real variables. A single doc_id is captured many times over
-  // a session — a live query once, and feature probes with empty variables behind it — and the
-  // body of a probe is not the body the query itself needs.
-  const hit = hits.find(entry => entry.variables && entry.variables !== '{}') ?? hits[0]
+  // Prefer a capture that carried real variables, and among those the most recent one. A single
+  // doc_id is captured many times over a session — a live query once, and feature probes with
+  // empty variables behind it — and the body of a probe is not the body the query itself needs.
+  //
+  // Recency matters because captures merge: a refreshed entry carries the run's live `fb_dtsg`
+  // and `lsd`, while an older copy of the same query carries tokens that have since rotated
+  // out — replaying the stale one is indistinguishable from a broken query (Instagram answers
+  // with its HTML page and no error). Entries written before `capturedAt` existed have no
+  // timestamp, sort as the oldest, and so keep the original first-with-real-variables pick.
+  const withVariables = hits.filter(entry => entry.variables && entry.variables !== '{}')
+  const newest = [...withVariables].sort((a, b) => (b.capturedAt ?? 0) - (a.capturedAt ?? 0))[0]
+  const hit = newest ?? hits[0]
 
   const encoded = hit.encoded ?? 'form'
   const captured = hit.variables ? JSON.parse(hit.variables) : {}
